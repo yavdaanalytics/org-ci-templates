@@ -39,6 +39,7 @@ jobs:
       with:
         ref: main
         fetch-depth: 0
+        persist-credentials: true
 
     # --------------------------------------------------
     # Create / update prod-deploy-testing branch
