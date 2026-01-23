@@ -6,25 +6,6 @@ on:
       production_app_name:
         required: true
         type: string
-
-      resource_group:
-        required: true
-        type: string
-
-      app_service_plan:
-        required: true
-        type: string
-
-      runtime:
-        required: false
-        type: string
-        default: "NODE|18-lts"
-
-      health_path:
-        required: false
-        type: string
-        default: /health
-
     secrets:
       AZURE_CREDENTIALS:
         required: true
@@ -38,7 +19,7 @@ jobs:
     env:
       TEST_BRANCH: prod-deploy-testing
       ARTIFACT_NAME: app-build
-      PREPROD_APP: ${{ inputs.production_app_name }}-preprod
+      PREPROD_SUFFIX: "-preprod"
 
     steps:
     # --------------------------------------------------
@@ -53,7 +34,7 @@ jobs:
     # --------------------------------------------------
     # Create / update prod-deploy-testing branch
     # --------------------------------------------------
-    - name: Create prod-deploy-testing branch
+    - name: Sync prod-deploy-testing branch
       run: |
         git checkout -B $TEST_BRANCH origin/main
         git push origin $TEST_BRANCH --force
@@ -80,7 +61,7 @@ jobs:
         path: app-build.zip
 
     # --------------------------------------------------
-    # Azure login
+    # Azure Login (OIDC)
     # --------------------------------------------------
     - name: Azure Login
       uses: azure/login@v1
@@ -88,18 +69,53 @@ jobs:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
 
     # --------------------------------------------------
-    # Create Pre-Prod App Service (same plan)
+    # DISCOVER PROD APP CONFIGURATION
+    # --------------------------------------------------
+    - name: Discover prod app configuration
+      id: discover
+      run: |
+        PROD_APP="${{ inputs.production_app_name }}"
+
+        RG=$(az webapp list \
+          --query "[?name=='$PROD_APP'].resourceGroup | [0]" \
+          -o tsv)
+
+        if [ -z "$RG" ]; then
+          echo "❌ Production app '$PROD_APP' not found"
+          exit 1
+        fi
+
+        PLAN_ID=$(az webapp show \
+          --name "$PROD_APP" \
+          --resource-group "$RG" \
+          --query serverFarmId \
+          -o tsv)
+
+        RUNTIME=$(az webapp config show \
+          --name "$PROD_APP" \
+          --resource-group "$RG" \
+          --query linuxFxVersion \
+          -o tsv)
+
+        echo "resource_group=$RG" >> $GITHUB_OUTPUT
+        echo "app_service_plan=$PLAN_ID" >> $GITHUB_OUTPUT
+        echo "runtime=$RUNTIME" >> $GITHUB_OUTPUT
+
+    # --------------------------------------------------
+    # CREATE PRE-PROD APP (SAME RG + PLAN + RUNTIME)
     # --------------------------------------------------
     - name: Create Pre-Prod App Service
       run: |
+        PREPROD_APP="${{ inputs.production_app_name }}${{ env.PREPROD_SUFFIX }}"
+
         az webapp create \
-          --name $PREPROD_APP \
-          --resource-group ${{ inputs.resource_group }} \
-          --plan ${{ inputs.app_service_plan }} \
-          --runtime "${{ inputs.runtime }}"
+          --name "$PREPROD_APP" \
+          --resource-group "${{ steps.discover.outputs.resource_group }}" \
+          --plan "${{ steps.discover.outputs.app_service_plan }}" \
+          --runtime "${{ steps.discover.outputs.runtime }}"
 
     # --------------------------------------------------
-    # Deploy artifact to Pre-Prod
+    # DEPLOY ARTIFACT TO PRE-PROD
     # --------------------------------------------------
     - name: Download build artifact
       uses: actions/download-artifact@v4
@@ -109,7 +125,7 @@ jobs:
     - name: Deploy to Pre-Prod
       uses: azure/webapps-deploy@v3
       with:
-        app-name: ${{ env.PREPROD_APP }}
+        app-name: ${{ inputs.production_app_name }}${{ env.PREPROD_SUFFIX }}
         publish-profile: ${{ secrets.PROD_PUBLISH_PROFILE }}
         package: app-build.zip
 
@@ -117,27 +133,25 @@ jobs:
       run: sleep 30
 
     # --------------------------------------------------
-    # Health check gate
+    # HEALTH CHECK GATE
     # --------------------------------------------------
     - name: Health check Pre-Prod
       run: |
-        URL="https://${PREPROD_APP}.azurewebsites.net${{ inputs.health_path }}"
-        echo "Checking $URL"
+        URL="https://${{ inputs.production_app_name }}${{ env.PREPROD_SUFFIX }}.azurewebsites.net/health"
 
         for i in {1..10}; do
           if curl -fs "$URL"; then
             echo "Pre-prod healthy"
             exit 0
           fi
-          echo "Retrying..."
           sleep 10
         done
 
-        echo "Pre-prod failed health check"
+        echo "Pre-prod health check failed"
         exit 1
 
     # --------------------------------------------------
-    # Deploy SAME artifact to Production
+    # DEPLOY SAME ARTIFACT TO PROD
     # --------------------------------------------------
     - name: Deploy to Production
       uses: azure/webapps-deploy@v3
@@ -147,20 +161,21 @@ jobs:
         package: app-build.zip
 
     # --------------------------------------------------
-    # Tag last-known-good commit
+    # TAG LAST-KNOWN-GOOD COMMIT
     # --------------------------------------------------
     - name: Tag last-known-good
       run: |
         git config user.name "github-actions"
         git config user.email "github-actions@github.com"
+
         git tag -f last-known-good
         git push origin last-known-good --force
 
     # --------------------------------------------------
-    # Delete Pre-Prod App Service
+    # DELETE PRE-PROD APP
     # --------------------------------------------------
     - name: Delete Pre-Prod App Service
       run: |
         az webapp delete \
-          --name $PREPROD_APP \
-          --resource-group ${{ inputs.resource_group }}
+          --name "${{ inputs.production_app_name }}${{ env.PREPROD_SUFFIX }}" \
+          --resource-group "${{ steps.discover.outputs.resource_group }}"
