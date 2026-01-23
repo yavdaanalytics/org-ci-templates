@@ -2,7 +2,7 @@
 # CONFIGURATION (CHANGE THESE)
 # ============================================================
 $Org            = "<GITHUB_ORG_NAME>"
-$Repo           = "*"        # use "*" for all repos in org
+$Repo           = "<GITHUB_REPO_NAME>"        # use "*" for all repos in org
 $Branch         = "main"
 $AppName        = "<APP_NAME>"
 $ResourceGroup  = "<RESOURCE_GROUP_NAME>"
@@ -59,14 +59,14 @@ az role assignment create `
 # ============================================================
 Write-Host "Creating OIDC Federated Credential..."
 
-$FederatedCredential = @"
-{
-  "name": "github-org-main",
-  "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:$Org/$Repo:ref:refs/heads/$Branch",
-  "audiences": ["api://AzureADTokenExchange"]
+$FederatedCredentialObject = @{ 
+  name     = "github-org-main"
+  issuer   = "https://token.actions.githubusercontent.com"
+  subject  = "repo:$Org/$Repo:ref:refs/heads/$Branch"
+  audiences = @("api://AzureADTokenExchange")
 }
-"@
+
+$FederatedCredential = $FederatedCredentialObject | ConvertTo-Json -Depth 3
 
 $FederatedCredential | Out-File federated.json -Encoding utf8
 
@@ -104,6 +104,6 @@ Write-Host "=============================================="
 Write-Host "✅ BOOTSTRAP COMPLETE"
 Write-Host "Azure AD App        : $AppName"
 Write-Host "Client ID           : $AppId"
-Write-Host "OIDC Scope          : repo:$Org/*:ref:refs/heads/$Branch"
+Write-Host "OIDC Scope          : repo:$Org/$Repo:ref:refs/heads/$Branch"
 Write-Host "GitHub Secret       : AZURE_CREDENTIALS (org-level)"
 Write-Host "=============================================="
