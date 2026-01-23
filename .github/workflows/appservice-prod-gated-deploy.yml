@@ -15,7 +15,7 @@ on:
         required: true
       PROD_PUBLISH_PROFILE:
         required: true
-      GITHUB_TOKEN:
+      CALLER_GITHUB_TOKEN:
         required: true
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
       with:
         ref: main
         fetch-depth: 0
-        token: ${{ secrets.GITHUB_TOKEN }}
+        token: ${{ secrets.CALLER_GITHUB_TOKEN }}
 
     # --------------------------------------------------
     # Create / update prod-deploy-testing branch
