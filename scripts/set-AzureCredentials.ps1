@@ -2,9 +2,9 @@
 # CONFIGURATION (CHANGE THESE)
 # ============================================================
 $Org            = "<GITHUB_ORG_NAME>"
-$Repo           = "<GITHUB_REPO_NAME>"        # use "*" for all repos in org
+$Repo           = "*"        # "*" = all repos, or set to a specific repo name
 $Branch         = "main"
-$AppName        = "<APP_NAME>"
+$AppName        = "github-actions-appservice"
 $ResourceGroup  = "<RESOURCE_GROUP_NAME>"
 $SubscriptionId = "<SUBSCRIPTION_ID>"
 
@@ -43,7 +43,7 @@ az ad sp create `
   | Out-Null
 
 # ============================================================
-# 3. ASSIGN RBAC ROLE (Contributor on RG)
+# 3. ASSIGN RBAC ROLE (Contributor on Resource Group)
 # ============================================================
 Write-Host "Assigning RBAC role..."
 
@@ -55,18 +55,21 @@ az role assignment create `
 
 # ============================================================
 # 4. CREATE FEDERATED OIDC CREDENTIAL
-#    (ALL REPOS IN ORG, MAIN BRANCH)
 # ============================================================
 Write-Host "Creating OIDC Federated Credential..."
 
-$FederatedCredentialObject = @{ 
-  name     = "github-org-main"
-  issuer   = "https://token.actions.githubusercontent.com"
-  subject  = ("repo:{0}/{1}:ref:refs/heads/{2}" -f $Org, $Repo, $Branch)
-  audiences = @("api://AzureADTokenExchange")
-}
+$FederatedSubject = "repo:$Org/$Repo:ref:refs/heads/$Branch"
 
-$FederatedCredential = $FederatedCredentialObject | ConvertTo-Json -Depth 3
+Write-Host "OIDC Subject: $FederatedSubject"
+
+$FederatedCredential = @"
+{
+  "name": "github-oidc-$Repo-$Branch",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "$FederatedSubject",
+  "audiences": ["api://AzureADTokenExchange"]
+}
+"@
 
 $FederatedCredential | Out-File federated.json -Encoding utf8
 
@@ -78,32 +81,21 @@ az ad app federated-credential create `
 Remove-Item federated.json -Force
 
 # ============================================================
-# 5. CREATE AZURE_CREDENTIALS JSON
+# 5. CREATE GITHUB ORG SECRETS (OIDC-CORRECT)
 # ============================================================
-Write-Host "Generating AZURE_CREDENTIALS JSON..."
+Write-Host "Saving GitHub org-level OIDC secrets..."
 
-$AzureCredentials = @{
-  clientId       = $AppId
-  tenantId       = $TenantId
-  subscriptionId = $SubscriptionId
-} | ConvertTo-Json -Compress
+$AppId | gh secret set AZURE_CLIENT_ID `
+  --org $Org `
+  --app actions
 
-# ============================================================
-# 6. SAVE AZURE_CREDENTIALS AS GITHUB ORG SECRET
-# ============================================================
-Write-Host "Saving AZURE_CREDENTIALS as GitHub org secret..."
+$TenantId | gh secret set AZURE_TENANT_ID `
+  --org $Org `
+  --app actions
 
-$AzureCredentials | gh secret set AZURE_CREDENTIALS `
+$SubscriptionId | gh secret set AZURE_SUBSCRIPTION_ID `
   --org $Org `
   --app actions
 
 # ============================================================
 # DONE
-# ============================================================
-Write-Host "=============================================="
-Write-Host "✅ BOOTSTRAP COMPLETE"
-Write-Host "Azure AD App        : $AppName"
-Write-Host "Client ID           : $AppId"
-Write-Host "OIDC Scope          : repo:$Org/$Repo:ref:refs/heads/$Branch"
-Write-Host "GitHub Secret       : AZURE_CREDENTIALS (org-level)"
-Write-Host "=============================================="
