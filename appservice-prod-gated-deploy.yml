@@ -1,0 +1,166 @@
+name: App Service Prod Gated Deployment
+
+on:
+  workflow_call:
+    inputs:
+      production_app_name:
+        required: true
+        type: string
+
+      resource_group:
+        required: true
+        type: string
+
+      app_service_plan:
+        required: true
+        type: string
+
+      runtime:
+        required: false
+        type: string
+        default: "NODE|18-lts"
+
+      health_path:
+        required: false
+        type: string
+        default: /health
+
+    secrets:
+      AZURE_CREDENTIALS:
+        required: true
+      PROD_PUBLISH_PROFILE:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      TEST_BRANCH: prod-deploy-testing
+      ARTIFACT_NAME: app-build
+      PREPROD_APP: ${{ inputs.production_app_name }}-preprod
+
+    steps:
+    # --------------------------------------------------
+    # Checkout main
+    # --------------------------------------------------
+    - name: Checkout main
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        fetch-depth: 0
+
+    # --------------------------------------------------
+    # Create / update prod-deploy-testing branch
+    # --------------------------------------------------
+    - name: Create prod-deploy-testing branch
+      run: |
+        git checkout -B $TEST_BRANCH origin/main
+        git push origin $TEST_BRANCH --force
+
+    # --------------------------------------------------
+    # BUILD ONCE
+    # --------------------------------------------------
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Build application
+      run: npm run build
+
+    - name: Package build artifact
+      run: |
+        zip -r app-build.zip . \
+          -x "*.git*" \
+          -x "node_modules/.cache/*"
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ARTIFACT_NAME }}
+        path: app-build.zip
+
+    # --------------------------------------------------
+    # Azure login
+    # --------------------------------------------------
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    # --------------------------------------------------
+    # Create Pre-Prod App Service (same plan)
+    # --------------------------------------------------
+    - name: Create Pre-Prod App Service
+      run: |
+        az webapp create \
+          --name $PREPROD_APP \
+          --resource-group ${{ inputs.resource_group }} \
+          --plan ${{ inputs.app_service_plan }} \
+          --runtime "${{ inputs.runtime }}"
+
+    # --------------------------------------------------
+    # Deploy artifact to Pre-Prod
+    # --------------------------------------------------
+    - name: Download build artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ env.ARTIFACT_NAME }}
+
+    - name: Deploy to Pre-Prod
+      uses: azure/webapps-deploy@v3
+      with:
+        app-name: ${{ env.PREPROD_APP }}
+        publish-profile: ${{ secrets.PROD_PUBLISH_PROFILE }}
+        package: app-build.zip
+
+    - name: Wait for Pre-Prod warm-up
+      run: sleep 30
+
+    # --------------------------------------------------
+    # Health check gate
+    # --------------------------------------------------
+    - name: Health check Pre-Prod
+      run: |
+        URL="https://${PREPROD_APP}.azurewebsites.net${{ inputs.health_path }}"
+        echo "Checking $URL"
+
+        for i in {1..10}; do
+          if curl -fs "$URL"; then
+            echo "Pre-prod healthy"
+            exit 0
+          fi
+          echo "Retrying..."
+          sleep 10
+        done
+
+        echo "Pre-prod failed health check"
+        exit 1
+
+    # --------------------------------------------------
+    # Deploy SAME artifact to Production
+    # --------------------------------------------------
+    - name: Deploy to Production
+      uses: azure/webapps-deploy@v3
+      with:
+        app-name: ${{ inputs.production_app_name }}
+        publish-profile: ${{ secrets.PROD_PUBLISH_PROFILE }}
+        package: app-build.zip
+
+    # --------------------------------------------------
+    # Tag last-known-good commit
+    # --------------------------------------------------
+    - name: Tag last-known-good
+      run: |
+        git config user.name "github-actions"
+        git config user.email "github-actions@github.com"
+        git tag -f last-known-good
+        git push origin last-known-good --force
+
+    # --------------------------------------------------
+    # Delete Pre-Prod App Service
+    # --------------------------------------------------
+    - name: Delete Pre-Prod App Service
+      run: |
+        az webapp delete \
+          --name $PREPROD_APP \
+          --resource-group ${{ inputs.resource_group }}
