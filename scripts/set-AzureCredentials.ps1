@@ -62,7 +62,7 @@ Write-Host "Creating OIDC Federated Credential..."
 $FederatedCredentialObject = @{ 
   name     = "github-org-main"
   issuer   = "https://token.actions.githubusercontent.com"
-  subject  = "repo:$Org/$Repo:ref:refs/heads/$Branch"
+  subject  = ("repo:{0}/{1}:ref:refs/heads/{2}" -f $Org, $Repo, $Branch)
   audiences = @("api://AzureADTokenExchange")
 }
 
