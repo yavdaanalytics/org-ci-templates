@@ -1,4 +1,4 @@
-name: App Service Prod Gated Deployment
+name: App Service Prod Gated Deployment (local fork)
 
 on:
   workflow_call:
@@ -22,7 +22,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    # 🔑 REQUIRED FOR OIDC
     permissions:
       id-token: write
       contents: write
@@ -33,9 +32,6 @@ jobs:
       PREPROD_SUFFIX: "-preprod"
 
     steps:
-    # --------------------------------------------------
-    # Checkout main
-    # --------------------------------------------------
     - name: Checkout main
       uses: actions/checkout@v4
       with:
@@ -43,17 +39,11 @@ jobs:
         fetch-depth: 0
         token: ${{ secrets.CALLER_GITHUB_TOKEN }}
 
-    # --------------------------------------------------
-    # Create / update prod-deploy-testing branch
-    # --------------------------------------------------
     - name: Sync prod-deploy-testing branch
       run: |
         git checkout -B $TEST_BRANCH origin/main
         git push origin $TEST_BRANCH --force
 
-    # --------------------------------------------------
-    # BUILD ONCE
-    # --------------------------------------------------
     - name: Install dependencies
       run: npm ci
 
@@ -72,124 +62,196 @@ jobs:
         name: ${{ env.ARTIFACT_NAME }}
         path: app-build.zip
 
-    # --------------------------------------------------
-    # Azure Login (OIDC — CORRECT)
-    # --------------------------------------------------
     - name: Azure Login (OIDC)
-      uses: azure/login@v1
+      uses: azure/login@v2
       with:
         client-id: ${{ secrets.AZURE_CLIENT_ID }}
         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-    # --------------------------------------------------
-    # DISCOVER PROD APP CONFIGURATION
-    # --------------------------------------------------
     - name: Discover prod app configuration
       id: discover
       run: |
         PROD_APP="${{ inputs.production_app_name }}"
-
-        RG=$(az webapp list \
-          --query "[?name=='$PROD_APP'].resourceGroup | [0]" \
-          -o tsv)
-
+        RG=$(az webapp list --query "[?name=='$PROD_APP'].resourceGroup | [0]" -o tsv)
         if [ -z "$RG" ]; then
           echo "❌ Production app '$PROD_APP' not found"
           exit 1
         fi
 
-        PLAN_ID=$(az webapp show \
-          --name "$PROD_APP" \
-          --resource-group "$RG" \
-          --query serverFarmId \
-          -o tsv)
+        PLAN_ID=$(az webapp show --name "$PROD_APP" --resource-group "$RG" --query serverFarmId -o tsv || echo "")
+        RUNTIME=$(az webapp config show --name "$PROD_APP" --resource-group "$RG" --query linuxFxVersion -o tsv || echo "")
 
-        RUNTIME=$(az webapp config show \
-          --name "$PROD_APP" \
-          --resource-group "$RG" \
-          --query linuxFxVersion \
-          -o tsv)
+        # Normalize plan name: extract basename if serverFarmId is a resource id
+        if [ -n "$PLAN_ID" ] && echo "$PLAN_ID" | grep -q "/serverFarms/"; then
+          PLAN_NAME=$(basename "$PLAN_ID")
+        else
+          PLAN_NAME="$PLAN_ID"
+        fi
 
-        echo "resource_group=$RG" >> $GITHUB_OUTPUT
-        echo "app_service_plan=$PLAN_ID" >> $GITHUB_OUTPUT
-        echo "runtime=$RUNTIME" >> $GITHUB_OUTPUT
+        # If plan name is still empty, try alternative queries
+        if [ -z "$PLAN_NAME" ]; then
+          # Try querying webapp list for serverFarmId
+          PLAN_NAME=$(az webapp list --query "[?name=='$PROD_APP'].serverFarmId | [0]" -o tsv || echo "")
+          if [ -n "$PLAN_NAME" ] && echo "$PLAN_NAME" | grep -q "/serverFarms/"; then
+            PLAN_NAME=$(basename "$PLAN_NAME")
+          fi
+        fi
 
-    # --------------------------------------------------
-    # CREATE PRE-PROD APP (INHERITS PROD)
-    # --------------------------------------------------
-    - name: Create Pre-Prod App Service
-      run: |
+        # If still empty, fallback to listing App Service Plans in the resource group
+        if [ -z "$PLAN_NAME" ]; then
+          PLAN_NAME=$(az appservice plan list --resource-group "$RG" --query "[0].name" -o tsv || echo "")
+        fi
+
         PREPROD_APP="${{ inputs.production_app_name }}${{ env.PREPROD_SUFFIX }}"
 
-        az webapp create \
-          --name "$PREPROD_APP" \
-          --resource-group "${{ steps.discover.outputs.resource_group }}" \
-          --plan "${{ steps.discover.outputs.app_service_plan }}" \
-          --runtime "${{ steps.discover.outputs.runtime }}"
+        if [ -z "$PLAN_NAME" ]; then
+          echo "❌ Unable to determine App Service plan for production app '$PROD_APP' (serverFarmId empty)"
+          echo "   Please ensure the production app exists and has an App Service Plan."
+          exit 1
+        fi
 
-    # --------------------------------------------------
-    # DEPLOY ARTIFACT TO PRE-PROD
-    # --------------------------------------------------
+        echo "resource_group=$RG" >> $GITHUB_OUTPUT
+        echo "app_service_plan=$PLAN_NAME" >> $GITHUB_OUTPUT
+        echo "runtime=$RUNTIME" >> $GITHUB_OUTPUT
+        echo "preprod_app=$PREPROD_APP" >> $GITHUB_OUTPUT
+
+    - name: Create or validate Pre-Prod App Service
+      run: |
+        PREPROD_APP="${{ steps.discover.outputs.preprod_app }}"
+        RG="${{ steps.discover.outputs.resource_group }}"
+        PLAN="${{ steps.discover.outputs.app_service_plan }}"
+        RUNTIME="${{ steps.discover.outputs.runtime }}"
+
+        echo "Ensuring pre-prod app: $PREPROD_APP in rg: $RG using plan: $PLAN and runtime: $RUNTIME"
+
+        # Check if app already exists
+        EXISTING=$(az webapp show --name "$PREPROD_APP" --resource-group "$RG" --query name -o tsv 2>/dev/null || echo "")
+        if [ -n "$EXISTING" ]; then
+          echo "Pre-prod app '$PREPROD_APP' already exists. Inspecting current plan and runtime..."
+          EXISTING_PLAN_ID=$(az webapp show --name "$PREPROD_APP" --resource-group "$RG" --query serverFarmId -o tsv || echo "")
+          if [ -n "$EXISTING_PLAN_ID" ]; then
+            EXISTING_PLAN_NAME=$(basename "$EXISTING_PLAN_ID")
+          else
+            EXISTING_PLAN_NAME=""
+          fi
+          EXISTING_RUNTIME=$(az webapp config show --name "$PREPROD_APP" --resource-group "$RG" --query linuxFxVersion -o tsv || echo "")
+
+          echo "Existing plan: $EXISTING_PLAN_NAME" 
+          echo "Existing runtime: $EXISTING_RUNTIME"
+
+          if [ -n "$PLAN" ] && [ "$PLAN" != "$EXISTING_PLAN_NAME" ]; then
+            echo "⚠️  App Service plan differs (existing=$EXISTING_PLAN_NAME, target=$PLAN)."
+            echo "   Azure does not allow changing the App Service Plan in-place when hosting constraints differ. Skipping plan change." 
+          fi
+
+          if [ -n "$RUNTIME" ] && [ "$RUNTIME" != "$EXISTING_RUNTIME" ]; then
+            echo "Updating runtime from '$EXISTING_RUNTIME' to '$RUNTIME'"
+            az webapp config set --resource-group "$RG" --name "$PREPROD_APP" --linux-fx-version "$RUNTIME"
+          else
+            echo "Runtime matches or not provided; no runtime change needed."
+          fi
+        else
+          echo "Pre-prod app does not exist; creating app $PREPROD_APP"
+          az webapp create \
+            --name "$PREPROD_APP" \
+            --resource-group "$RG" \
+            --plan "$PLAN" \
+            --runtime "$RUNTIME"
+        fi
+
     - name: Download build artifact
       uses: actions/download-artifact@v4
       with:
         name: ${{ env.ARTIFACT_NAME }}
+        path: .
 
-    - name: Deploy to Pre-Prod
-      uses: azure/webapps-deploy@v3
-      with:
-        app-name: ${{ inputs.production_app_name }}${{ env.PREPROD_SUFFIX }}
-        publish-profile: ${{ secrets.PROD_PUBLISH_PROFILE }}
-        package: app-build.zip
-
-    - name: Wait for Pre-Prod warm-up
-      run: sleep 30
-
-    # --------------------------------------------------
-    # HEALTH CHECK GATE
-    # --------------------------------------------------
-    - name: Health check Pre-Prod
+    - name: Deploy to Pre-Prod (OIDC with retries)
       run: |
-        URL="https://${{ inputs.production_app_name }}${{ env.PREPROD_SUFFIX }}.azurewebsites.net/health"
+        PREPROD_APP="${{ steps.discover.outputs.preprod_app }}"
+        RG="${{ steps.discover.outputs.resource_group }}"
+        echo "Deploying to preprod app $PREPROD_APP in $RG using OIDC with retry logic"
 
-        for i in {1..10}; do
+        attempts=0
+        max_attempts=3
+        until [ $attempts -ge $max_attempts ]
+        do
+          attempts=$((attempts+1))
+          echo "Preprod deploy attempt $attempts of $max_attempts"
+          if az webapp deploy --resource-group "$RG" --name "$PREPROD_APP" --src-path app-build.zip --type zip; then
+            echo "Preprod deploy succeeded"
+            break
+          fi
+          echo "Preprod deploy attempt $attempts failed, sleeping $((attempts * 30))s before retry"
+          sleep $((attempts * 30))
+        done
+        if [ $attempts -ge $max_attempts ]; then
+          echo "❌ Deployment to preprod failed after $max_attempts attempts"
+          echo "Listing deployments for preprod app:"
+          az webapp deployment list --resource-group "$RG" --name "$PREPROD_APP" -o table || true
+          echo "Attempting to fetch latest Kudu deployment info (may require auth):"
+          curl -sS "https://${PREPROD_APP}.scm.azurewebsites.net/api/deployments/latest" || true
+          exit 1
+        fi
+
+    - name: Wait for Pre-Prod warm-up and Health check
+      run: |
+        PREPROD_APP="${{ steps.discover.outputs.preprod_app }}"
+        URL="https://${PREPROD_APP}.azurewebsites.net/health"
+        echo "Waiting 60s for preprod warm-up..."
+        sleep 60
+        for i in {1..12}; do
           if curl -fs "$URL"; then
             echo "Pre-prod healthy"
             exit 0
           fi
+          echo "Health check attempt $i failed, retrying..."
           sleep 10
         done
-
-        echo "❌ Pre-prod health check failed"
+        echo "❌ Pre-prod health check failed after retries"
+        echo "Listing deployments for preprod app:"
+        az webapp deployment list --resource-group "${{ steps.discover.outputs.resource_group }}" --name "$PREPROD_APP" -o table || true
+        echo "Attempting to fetch latest Kudu deployment info (may require auth):"
+        curl -sS "https://${PREPROD_APP}.scm.azurewebsites.net/api/deployments/latest" || true
         exit 1
 
-    # --------------------------------------------------
-    # DEPLOY SAME ARTIFACT TO PROD
-    # --------------------------------------------------
-    - name: Deploy to Production
-      uses: azure/webapps-deploy@v3
-      with:
-        app-name: ${{ inputs.production_app_name }}
-        publish-profile: ${{ secrets.PROD_PUBLISH_PROFILE }}
-        package: app-build.zip
+    - name: Deploy to Production (OIDC with retries)
+      run: |
+        PROD_APP="${{ inputs.production_app_name }}"
+        RG="${{ steps.discover.outputs.resource_group }}"
+        echo "Deploying artifact to production app $PROD_APP in $RG using OIDC with retry logic"
 
-    # --------------------------------------------------
-    # TAG LAST-KNOWN-GOOD
-    # --------------------------------------------------
+        attempts=0
+        max_attempts=3
+        until [ $attempts -ge $max_attempts ]
+        do
+          attempts=$((attempts+1))
+          echo "Production deploy attempt $attempts of $max_attempts"
+          if az webapp deploy --resource-group "$RG" --name "$PROD_APP" --src-path app-build.zip --type zip; then
+            echo "Production deploy succeeded"
+            break
+          fi
+          echo "Production deploy attempt $attempts failed, sleeping $((attempts * 30))s before retry"
+          sleep $((attempts * 30))
+        done
+        if [ $attempts -ge $max_attempts ]; then
+          echo "❌ Deployment to production failed after $max_attempts attempts"
+          echo "Listing deployments for production app:"
+          az webapp deployment list --resource-group "$RG" --name "$PROD_APP" -o table || true
+          echo "Attempting to fetch latest Kudu deployment info (may require auth):"
+          curl -sS "https://${PROD_APP}.scm.azurewebsites.net/api/deployments/latest" || true
+          exit 1
+        fi
+
     - name: Tag last-known-good
       run: |
         git config user.name "github-actions"
         git config user.email "github-actions@github.com"
-
         git tag -f last-known-good
         git push origin last-known-good --force
 
-    # --------------------------------------------------
-    # DELETE PRE-PROD APP
-    # --------------------------------------------------
     - name: Delete Pre-Prod App Service
       run: |
         az webapp delete \
-          --name "${{ inputs.production_app_name }}${{ env.PREPROD_SUFFIX }}" \
+          --name "${{ steps.discover.outputs.preprod_app }}" \
           --resource-group "${{ steps.discover.outputs.resource_group }}"
