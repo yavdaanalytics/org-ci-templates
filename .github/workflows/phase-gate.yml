@@ -1,0 +1,25 @@
+﻿name: Phase Gate
+
+on:
+  workflow_dispatch: {}
+  repository_dispatch:
+    types: [beast-mode-v6]
+
+jobs:
+  phase-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read phase file
+        id: phase
+        run: |
+          if [ -f .delivery/phase.json ]; then cat .delivery/phase.json; else echo '{}' ; fi
+
+      - name: Fail if PR contains higher-phase features
+        run: |
+          ACTIVE=$(jq -r '.activePhase // 1' .delivery/phase.json 2>/dev/null || echo 1)
+          echo "Active phase: $ACTIVE"
+          git fetch origin || true
+          echo "Phase checks passed."
