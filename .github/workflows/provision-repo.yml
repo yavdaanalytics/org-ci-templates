@@ -1,0 +1,55 @@
+name: Provision Repository from Template
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_name:
+        description: 'New repository name (e.g. order-matching-service)'
+        required: true
+        type: string
+      visibility:
+        description: 'Repository visibility'
+        required: true
+        type: choice
+        options:
+          - private
+          - public
+        default: 'private'
+      milestone_name:
+        description: 'Initial Milestone Name (e.g. Candidate Matching MVP)'
+        required: false
+        type: string
+        default: 'MVP 1'
+
+permissions:
+  contents: write
+
+jobs:
+  provision:
+    name: Mint New Repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Repository Name
+        run: |
+          if [[ ! "${{ inputs.repo_name }}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "Invalid repository name: ${{ inputs.repo_name }}"
+            exit 1
+          fi
+
+      - name: Provision from Template via GitHub CLI
+        run: |
+          echo "Minting yavdaanalytics/${{ inputs.repo_name }} from template candidate-intelligence-template..."
+          gh repo create "yavdaanalytics/${{ inputs.repo_name }}" \
+            --template "yavdaanalytics/candidate-intelligence-template" \
+            --${{ inputs.visibility }}
+
+          if [ -n "${{ inputs.milestone_name }}" ]; then
+            echo "Creating initial milestone: ${{ inputs.milestone_name }}..."
+            gh api -X POST "repos/yavdaanalytics/${{ inputs.repo_name }}/milestones" \
+              -f title="${{ inputs.milestone_name }}" \
+              -f description="Release goal and delivery milestone" || true
+          fi
+
+          echo "Repository https://github.com/yavdaanalytics/${{ inputs.repo_name }} is ready!"
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
